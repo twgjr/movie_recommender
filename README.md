@@ -26,19 +26,29 @@ An AI-powered movie recommendation system using KNN-based collaborative filterin
    git push -u origin main
    ```
 
-2. **Deploy Backend:**
-   - Railway → New Project → Deploy from GitHub
-   - Select this repo
-   - Set Root Directory: `back_end`
-   - Add environment variable: `OMDB_API_KEY=<your-key>`
-   - Copy the generated backend URL
+2. **Deploy Backend Service:**
+   - Go to Railway → New Project → Deploy from GitHub
+   - Select this repository
+   - Railway will detect the `start.sh` file
+   - Add these environment variables:
+     - `SERVICE=backend`
+     - `OMDB_API_KEY=<your-omdb-api-key>`
+   - The backend will be deployed at the generated Railway URL
+   - Copy this URL for the frontend configuration
 
-3. **Deploy Frontend:**
-   - Railway → Add Service → GitHub Repo
-   - Select this repo again
-   - Set Root Directory: `front_end`
-   - Add environment variable: `VITE_API_BASE_URL=<your-backend-url>`
-   - Deploy!
+3. **Deploy Frontend Service:**
+   - In the same Railway project → New Service → GitHub Repo
+   - Select this repository again
+   - Add these environment variables:
+     - `SERVICE=frontend`
+     - `VITE_API_BASE_URL=<your-backend-railway-url>`
+   - The frontend will be deployed at a separate Railway URL
+
+### Important Notes
+- The `start.sh` script automatically detects which service to run based on the `SERVICE` environment variable
+- Make sure both services are in the same Railway project for easier management
+- The backend needs access to the `data/` folder with CSV files
+- Set appropriate CORS origins in `back_end/main.py` if needed
 
 ## Local Development
 
