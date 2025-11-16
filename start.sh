@@ -10,6 +10,6 @@ if [ "$SERVICE" = "frontend" ]; then
 else
     echo "Starting backend service..."
     cd back_end
-    pip install --no-cache-dir -r requirements.txt
-    uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+    python3 -m pip install --no-cache-dir -r requirements.txt
+    python3 -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
 fi
