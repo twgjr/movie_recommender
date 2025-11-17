@@ -21,6 +21,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173", 
         "http://localhost:3000",
+        "http://localhost:3001",
+        "https://movie-recommender-front-end.onrender.com",  # Your deployed frontend
         "https://*.vercel.app",  # Allow Vercel deployments
         "https://*.netlify.app",  # Allow Netlify deployments
     ],
