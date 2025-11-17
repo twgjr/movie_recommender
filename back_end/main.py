@@ -31,10 +31,9 @@ app.add_middleware(
 
 # Load API key from environment variable
 OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 
 # Initialize paths for KNN recommender
-BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
 RATINGS_FILE = DATA_DIR / "ratings_binary_genres_tfidf.csv"
 LINKS_FILE = DATA_DIR / "links.csv"
 MOVIES_FILE = DATA_DIR / "movies.csv"
