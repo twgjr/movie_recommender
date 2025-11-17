@@ -1,6 +1,10 @@
 // API configuration
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
+// Debug: Log the API base URL being used
+console.log('🔧 API_BASE_URL configured as:', API_BASE_URL);
+console.log('🔧 Environment variables:', import.meta.env);
+
 export interface OMDbMovieDetail {
   imdbID: string;
   Title: string;
@@ -60,7 +64,9 @@ export async function getInitialRecommendations(
 ): Promise<ApiResponse<OMDbMovieDetail[]>> {
   try {
     const params = new URLSearchParams({ limit: limit.toString() });
-    const response = await fetch(`${API_BASE_URL}/api/recommendations/initial?${params}`);
+    const url = `${API_BASE_URL}/api/recommendations/initial?${params}`;
+    console.log('🌐 Fetching initial recommendations from:', url);
+    const response = await fetch(url);
     
     if (!response.ok) {
       const errorData = await response.json();
