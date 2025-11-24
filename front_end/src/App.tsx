@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react";
 import { Movie } from "./components/MovieCard";
 import { DetailsModal } from "./components/DetailsModal";
+import { SearchResultsModal } from "./components/SearchResultsModal";
 import { Button } from "./components/ui/button";
 import { MovieRow } from "./components/MovieRow";
 import { Input } from "./components/ui/input";
-import { getInitialRecommendations, getRecommendationsFromPreferences, addPreferenceAndGetRecommendations, OMDbMovieDetail, UserPreference } from "./services/movieApi";
-import { Loader2 } from "lucide-react";
+import { getInitialRecommendations, getRecommendationsFromPreferences, addPreferenceAndGetRecommendations, getSimilarMovies, searchMoviesByQuery, OMDbMovieDetail, UserPreference } from "./services/movieApi";
+import { Loader2, Search } from "lucide-react";
 
 // Helper function to convert OMDb movie to our Movie format
 function convertOMDbToMovie(omdbMovie: OMDbMovieDetail): Movie {
@@ -36,11 +37,16 @@ export default function App() {
   const [ratings, setRatings] = useState<Record<number, "up" | "down">>({});
   const [selectedMovie, setSelectedMovie] = useState<Movie | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  const [searchModalOpen, setSearchModalOpen] = useState(false);
   const [movies, setMovies] = useState<Movie[]>([]);
+  const [searchResults, setSearchResults] = useState<Movie[]>([]);
   const [movieQuery, setMovieQuery] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
   const [isUpdatingRecommendations, setIsUpdatingRecommendations] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [similarMovies, setSimilarMovies] = useState<Record<number, Movie[]>>({});
 
   // Fetch initial recommendations on mount
   useEffect(() => {
@@ -62,15 +68,72 @@ export default function App() {
     fetchInitialMovies();
   }, []); // Empty dependency array means this runs once on mount
 
+  // Fetch similar movies for each liked movie
+  useEffect(() => {
+    const fetchSimilarMovies = async () => {
+      const likedMoviesList = movies.filter((movie) => ratings[movie.id] === "up");
+      
+      for (const likedMovie of likedMoviesList) {
+        // Skip if we already have similar movies for this one
+        if (similarMovies[likedMovie.id]) continue;
+        
+        const imdbIdWithoutPrefix = likedMovie.imdbID.replace('tt', '');
+        console.log(`Fetching similar movies for ${likedMovie.title} (${imdbIdWithoutPrefix})...`);
+        const result = await getSimilarMovies(imdbIdWithoutPrefix, 10);
+        
+        if (result.data) {
+          console.log(`Received ${result.data.length} similar movies for ${likedMovie.title}`);
+          const convertedSimilar = result.data.map(convertOMDbToMovie);
+          setSimilarMovies(prev => ({
+            ...prev,
+            [likedMovie.id]: convertedSimilar
+          }));
+        } else if (result.error) {
+          console.error(`Error fetching similar movies for ${likedMovie.title}:`, result.error);
+        }
+      }
+    };
+
+    const likedMoviesList = movies.filter((movie) => ratings[movie.id] === "up");
+    if (likedMoviesList.length > 0) {
+      fetchSimilarMovies();
+    }
+  }, [ratings, movies, similarMovies]); // Include all dependencies
+
   // Categorize movies
   const topRecommendations = movies.filter((movie) => !ratings[movie.id]);
   const likedMovies = movies.filter((movie) => ratings[movie.id] === "up");
   const dislikedMovies = movies.filter((movie) => ratings[movie.id] === "down");
 
   const handleRate = async (movieId: number, rating: "up" | "down") => {
-    // Find the movie to get its IMDb ID
-    const movie = movies.find(m => m.id === movieId);
-    if (!movie) return;
+    // Find the movie to get its IMDb ID - search in movies, searchResults, and similarMovies
+    let movie = movies.find(m => m.id === movieId);
+    
+    // If not found in main movies list, search in search results
+    if (!movie) {
+      movie = searchResults.find(m => m.id === movieId);
+    }
+    
+    // If still not found, search in similar movies
+    if (!movie) {
+      for (const similarMoviesList of Object.values(similarMovies)) {
+        movie = similarMoviesList.find(m => m.id === movieId);
+        if (movie) break;
+      }
+    }
+    
+    if (!movie) {
+      console.error(`Movie with id ${movieId} not found`);
+      return;
+    }
+    
+    // Add the movie to the main movies list if it's not already there
+    setMovies(prev => {
+      if (prev.some(m => m.id === movieId)) {
+        return prev;
+      }
+      return [...prev, movie!];
+    });
     
     // Update local ratings state immediately for UI responsiveness
     setRatings((prev) => ({
@@ -82,10 +145,13 @@ export default function App() {
     const imdbIdWithoutPrefix = movie.imdbID.replace('tt', '');
     const ratingValue = rating === 'up' ? 1.0 : 0.0;
     
-    // Get current preferences as UserPreference array
-    const currentPreferences: UserPreference[] = Object.entries(ratings)
+    // Get current preferences as UserPreference array (including the new rating)
+    const updatedRatings = { ...ratings, [movieId]: rating };
+    const currentPreferences: UserPreference[] = Object.entries(updatedRatings)
       .map(([id, rat]) => {
-        const m = movies.find(movie => movie.id === parseInt(id));
+        const m = movies.find(movie => movie.id === parseInt(id)) || 
+                 searchResults.find(movie => movie.id === parseInt(id)) ||
+                 (movie?.id === parseInt(id) ? movie : null);
         return m ? {
           imdb_id: m.imdbID.replace('tt', ''),
           rating: rat === 'up' ? 1.0 : 0.0
@@ -107,8 +173,8 @@ export default function App() {
       
       // Replace top recommendations (unrated movies) with new recommendations
       setMovies(prevMovies => {
-        // Keep rated movies
-        const ratedMovies = prevMovies.filter(m => ratings[m.id] || m.id === movieId);
+        // Keep rated movies (including the newly rated one)
+        const ratedMovies = prevMovies.filter(m => updatedRatings[m.id]);
         
         // Filter out duplicates from new recommendations
         const uniqueNewRecs = newRecommendations.filter(
@@ -127,6 +193,34 @@ export default function App() {
   const handleDetails = (movie: Movie) => {
     setSelectedMovie(movie);
     setModalOpen(true);
+  };
+
+  const handleSearch = async () => {
+    if (!searchQuery.trim()) {
+      setError("Please enter a search query");
+      return;
+    }
+
+    setIsSearching(true);
+    setError(null);
+
+    const result = await searchMoviesByQuery(searchQuery, 25);
+    
+    if (result.data) {
+      const convertedMovies = result.data.map(convertOMDbToMovie);
+      setSearchResults(convertedMovies);
+      setSearchModalOpen(true);
+    } else {
+      setError(result.error || "Failed to search movies");
+    }
+
+    setIsSearching(false);
+  };
+
+  const handleSearchKeyPress = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      handleSearch();
+    }
   };
 
 
@@ -185,6 +279,32 @@ export default function App() {
               <h1 className="text-[#F5C518] text-2xl md:text-3xl font-bold">Movie Recommender</h1>
             </div>
 
+            {/* Search Bar */}
+            <div className="flex gap-2">
+              <div className="flex-1 relative">
+                <Input
+                  type="text"
+                  placeholder="Search for movies (e.g., 'action sci-fi thriller with robots')..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyPress={handleSearchKeyPress}
+                  className="bg-[#2a2a2a] border-white/20 text-white placeholder:text-gray-400 pr-10"
+                  disabled={isSearching}
+                />
+                {isSearching && (
+                  <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 animate-spin text-[#F5C518]" />
+                )}
+              </div>
+              <Button
+                onClick={handleSearch}
+                disabled={isSearching || !searchQuery.trim()}
+                className="bg-[#F5C518] text-black hover:bg-[#F5C518]/90 disabled:opacity-50"
+              >
+                <Search className="w-4 h-4 mr-2" />
+                Search
+              </Button>
+            </div>
+
             {/* Error Message */}
             {error && (
               <div className="text-sm text-red-500">
@@ -211,6 +331,19 @@ export default function App() {
               ratings={ratings}
               emptyMessage="No movies yet. Enter a movie title above to fetch from OMDb!"
             />
+            
+            {/* Because you liked sections */}
+            {likedMovies.map((likedMovie) => (
+              <MovieRow
+                key={`similar-${likedMovie.id}`}
+                title={`Because you liked "${likedMovie.title}"`}
+                movies={similarMovies[likedMovie.id] || []}
+                onRate={handleRate}
+                onDetails={handleDetails}
+                ratings={ratings}
+                emptyMessage="Loading similar movies..."
+              />
+            ))}
             
             <MovieRow
               title="Liked Movies"
@@ -240,6 +373,17 @@ export default function App() {
         onClose={() => setModalOpen(false)}
         onRate={handleRate}
         rating={selectedMovie ? ratings[selectedMovie.id] : undefined}
+      />
+
+      {/* Search Results Modal */}
+      <SearchResultsModal
+        movies={searchResults}
+        open={searchModalOpen}
+        onClose={() => setSearchModalOpen(false)}
+        onRate={handleRate}
+        onDetails={handleDetails}
+        ratings={ratings}
+        searchQuery={searchQuery}
       />
     </div>
   );

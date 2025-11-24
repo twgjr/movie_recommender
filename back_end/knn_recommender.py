@@ -1,8 +1,8 @@
 """
 KNN Movie Recommendation System using FAISS
 
-This module implements a KNN-based movie recommender using genre TF-IDF features
-from the MovieLens dataset. It uses FAISS for efficient similarity search and
+This module implements a KNN-based movie recommender using semantic embeddings
+from the all-MiniLM-L6-v2 model. It uses FAISS for efficient similarity search and
 integrates with OMDb API for displaying movie details.
 """
 
@@ -12,12 +12,12 @@ import faiss
 import os
 from typing import List, Dict, Optional
 import httpx
-import ast
+from sentence_transformers import SentenceTransformer
 
 
 class KNNMovieRecommender:
     """
-    KNN-based movie recommender using FAISS for similarity search
+    KNN-based movie recommender using FAISS for similarity search with semantic embeddings
     """
     
     def __init__(self, data_path: str, omdb_api_key: str = "", k: int = 100):
@@ -25,157 +25,190 @@ class KNNMovieRecommender:
         self.omdb_api_key = omdb_api_key
         self.k = k
         self.index = None
-        self.genre_columns = []
-        self.train_idx_to_movies = {}
-        self.movie_id_to_imdb = {}  # Mapping from MovieLens ID to IMDb ID
-        self.imdb_to_movie_id = {}  # Reverse mapping
-        self.movies_df = None  # Local movie data for fallback
+        self.movies_df = None
+        self.embeddings = None
+        self.embedding_model = None
+        self.imdb_id_to_idx = {}  # Map IMDb ID to index in embeddings array
         
     def load_data(self, chunk_size: int = 100000):
         """
-        Load the MovieLens training dataset
+        Load the movies with embeddings dataset
         """
+        # Read the CSV file with embeddings
+        print("Loading movies with embeddings...")
+        self.movies_df = pd.read_csv(self.data_path, low_memory=False)
         
-        # Read the data in chunks due to large file size
-        train_chunks = []
-        for chunk in pd.read_csv(self.data_path, chunksize=chunk_size):
-            train_chunks.append(chunk)
+        # Extract embedding columns (emb_0 through emb_383)
+        embedding_cols = [col for col in self.movies_df.columns if col.startswith('emb_')]
+        self.embeddings = self.movies_df[embedding_cols].values.astype(np.float32)
         
-        train_data = pd.concat(train_chunks, ignore_index=True)
+        # Create mapping from IMDb ID to index
+        for idx, imdb_id in enumerate(self.movies_df['imdb_id'].values):
+            # Format IMDb ID to match OMDB format (tt followed by 7 digits)
+            formatted_id = f"tt{str(int(imdb_id)).zfill(7)}"
+            self.imdb_id_to_idx[formatted_id] = idx
         
-        # Identify genre columns
-        self.genre_columns = [col for col in train_data.columns if col.startswith('genre_')]
-        
-        # Extract genre features
-        X_train_dict = {}
-        for col in self.genre_columns:
-            X_train_dict[col] = train_data[col].values.astype(np.float32)
-        self.X_train = np.column_stack([X_train_dict[col] for col in self.genre_columns]).astype(np.float32)
-
-        # map training indices to MovieLens IDs
-        # self.train_idx_to_movies = {}
-        # for idx, movie_id in enumerate(train_data['movieId'].values):
-        #     if idx not in self.train_idx_to_movies:
-        #         self.train_idx_to_movies[idx] = []
-        #     self.train_idx_to_movies[idx].append(movie_id)
-        self.train_idx_to_movies = {}
-        for row in train_data.itertuples():
-            idx = row.Index
-            movie_id_list = row.movieId # df has actually a list of movieIds
-
-            # convert string representation of list to actual list
-            movie_id_list = ast.literal_eval(str(movie_id_list))
-
-            if type(movie_id_list) is not list:
-                raise ValueError(f"Expected list of movieIds, got {type(movie_id_list)}: {movie_id_list}")
-
-            self.train_idx_to_movies[idx] = movie_id_list
+        print(f"Loaded {len(self.movies_df)} movies with {self.embeddings.shape[1]}-dimensional embeddings")
     
-    def compute_mean_genre_vector(self) -> np.ndarray:
+    def load_embedding_model(self):
         """
-        Compute the mean genre vector across all training data
+        Load the sentence transformer model for generating query embeddings
         """
-        return np.mean(self.X_train, axis=0).astype(np.float32)
+        print("Loading embedding model: all-MiniLM-L6-v2...")
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        print(f"Model loaded. Embedding dimension: {self.embedding_model.get_sentence_embedding_dimension()}")
+    
+    def create_query_embedding(self, text: str) -> np.ndarray:
+        """
+        Create an embedding for a query text using the same model as preprocessing
+        """
+        if self.embedding_model is None:
+            self.load_embedding_model()
+        
+        embedding = self.embedding_model.encode(text, show_progress_bar=False)
+        return embedding.astype(np.float32)
+    
+    def compute_mean_embedding(self) -> np.ndarray:
+        """
+        Compute the mean embedding across all movies in the database
+        This represents the "average" movie and provides a neutral starting point
+        """
+        return np.mean(self.embeddings, axis=0).astype(np.float32)
+    
+    def compute_weighted_embedding_from_preferences(
+        self, 
+        liked_imdb_ids: List[str], 
+        disliked_imdb_ids: List[str]
+    ) -> Optional[np.ndarray]:
+        """
+        Compute a weighted embedding based on user preferences:
+        - Add embeddings for liked movies
+        - Subtract embeddings for disliked movies
+        - Divide by total number of ratings
+        
+        Args:
+            liked_imdb_ids: List of IMDb IDs for liked movies
+            disliked_imdb_ids: List of IMDb IDs for disliked movies
+            
+        Returns:
+            Weighted embedding vector or None if no valid preferences
+        """
+        liked_embeddings = []
+        disliked_embeddings = []
+        
+        # Collect embeddings for liked movies
+        for imdb_id in liked_imdb_ids:
+            if imdb_id in self.imdb_id_to_idx:
+                idx = self.imdb_id_to_idx[imdb_id]
+                liked_embeddings.append(self.embeddings[idx])
+        
+        # Collect embeddings for disliked movies
+        for imdb_id in disliked_imdb_ids:
+            if imdb_id in self.imdb_id_to_idx:
+                idx = self.imdb_id_to_idx[imdb_id]
+                disliked_embeddings.append(self.embeddings[idx])
+        
+        # Need at least one preference
+        total_count = len(liked_embeddings) + len(disliked_embeddings)
+        if total_count == 0:
+            return None
+        
+        # Calculate weighted sum: likes + dislikes (as negative contribution)
+        weighted_sum = np.zeros_like(self.embeddings[0])
+        
+        if liked_embeddings:
+            weighted_sum += np.sum(liked_embeddings, axis=0)
+        
+        if disliked_embeddings:
+            weighted_sum -= np.sum(disliked_embeddings, axis=0)
+        
+        # Divide by total count to get the mean
+        weighted_embedding = weighted_sum / total_count
+        
+        return weighted_embedding.astype(np.float32)
 
     def build_index(self):
         """Build FAISS index for efficient similarity search"""
         
-        dimension = self.X_train.shape[1]
+        dimension = self.embeddings.shape[1]
         
         # Create a FAISS index using L2 (Euclidean) distance
         self.index = faiss.IndexFlatL2(dimension)
         
-        # Add training vectors to the index
-        self.index.add(self.X_train)
+        # Add embedding vectors to the index
+        self.index.add(self.embeddings)
+        
+        print(f"FAISS index built with {self.index.ntotal} vectors")
         
     def load_movielens_to_imdb_mapping(self, links_file: str, movies_file: Optional[str] = None):
         """
-        Load mapping from MovieLens IDs to IMDb IDs and movie metadata
+        This method is kept for backwards compatibility but is no longer needed
+        since embeddings CSV already contains IMDb IDs and movie metadata
         """
-        links_df = pd.read_csv(links_file)
+        pass
         
-        # Create mapping dictionary
-        for _, row in links_df.iterrows():
-            ml_id = int(row['movieId'])
-            imdb_id = f"tt{int(row['imdbId']):07d}"  # Format as tt followed by 7-digit zero-padded number
-            self.movie_id_to_imdb[ml_id] = imdb_id
-            self.imdb_to_movie_id[imdb_id] = ml_id
-        
-        # Load movies data for fallback
-        if movies_file:
-            self.movies_df = pd.read_csv(movies_file)
-            # Merge with links to have IMDb IDs
-            self.movies_df = pd.merge(self.movies_df, links_df, on='movieId', how='left')
-            self.movies_df['imdbID'] = self.movies_df['imdbId'].apply(
-                lambda x: f"tt{int(x):07d}" if pd.notna(x) else None
-            )
-        
-    def get_similar_movies(self, genre_features: np.ndarray, k: Optional[int] = None) -> List[int]:
+    def get_similar_movies(self, query_embedding: np.ndarray, k: Optional[int] = None) -> List[str]:
         """
-        Query the FAISS index to find k most similar movies based on genre features
+        Query the FAISS index to find k most similar movies based on embeddings
+        
+        Args:
+            query_embedding: The query embedding vector
+            k: Number of similar movies to return
+            
+        Returns:
+            List of IMDb IDs for similar movies
         """
         if k is None:
             k = self.k
             
         # Ensure query vector is the right shape and type
-        if genre_features.ndim == 1:
-            genre_features = genre_features.reshape(1, -1)
-        genre_features = genre_features.astype(np.float32)
+        if query_embedding.ndim == 1:
+            query_embedding = query_embedding.reshape(1, -1)
+        query_embedding = query_embedding.astype(np.float32)
         
         # Search the index
-        distances, indices = self.index.search(genre_features, k)
+        distances, indices = self.index.search(query_embedding, k)
 
-        # Get the movie lists for the retrieved indices
-        similar_movies = {}
+        # Get the IMDb IDs for the retrieved indices
+        similar_movies = []
         for idx in indices[0]:
-            movies = self.train_idx_to_movies[idx]
-            for movieId in movies:
-                imdb_id = self.movie_id_to_imdb[movieId]
-                if imdb_id not in similar_movies:
-                    similar_movies[imdb_id] = 1
-                else:
-                    similar_movies[imdb_id] += 1
-
-        # list of unique similar movies sorted by frequency descending 
-        unique_similar_movies = sorted(similar_movies.keys(), key=lambda x: similar_movies[x], reverse=True)
+            imdb_id = self.movies_df.iloc[idx]['imdb_id']
+            # Format as tt followed by 7 digits
+            formatted_id = f"tt{str(int(imdb_id)).zfill(7)}"
+            similar_movies.append(formatted_id)
         
-        return unique_similar_movies
+        return similar_movies
     
     def get_local_movie_details(self, imdb_id: str) -> Optional[Dict]:
         """
-        Get movie details from local movies.csv as fallback
+        Get movie details from local movies_with_embeddings.csv
         """
         if self.movies_df is None:
             return None
         
         try:
-            movie_row = self.movies_df[self.movies_df['imdbID'] == imdb_id]
+            movie_row = self.movies_df[self.movies_df['imdb_id'] == int(imdb_id.replace('tt', ''))]
             
             if movie_row.empty:
                 return None
             
             row = movie_row.iloc[0]
-            title_with_year = row['title']
-            
-            # Extract year from title (format: "Title (YYYY)")
-            year = "N/A"
-            title = title_with_year
-            if '(' in title_with_year and ')' in title_with_year:
-                parts = title_with_year.rsplit('(', 1)
-                if len(parts) == 2:
-                    title = parts[0].strip()
-                    year = parts[1].replace(')', '').strip()
             
             # Create OMDb-like response with local data
             return {
                 "imdbID": imdb_id,
-                "Title": title,
-                "Year": year,
-                "Genre": row['genres'].replace('|', ', ') if pd.notna(row['genres']) else "N/A",
-                "Plot": "Plot information not available from local data.",
+                "Title": row['title'] if pd.notna(row['title']) else "N/A",
+                "Year": row['year'] if pd.notna(row['year']) else "N/A",
+                "Genre": row['genre'] if pd.notna(row['genre']) else "N/A",
+                "Director": row['director'] if pd.notna(row['director']) else "N/A",
+                "Actors": row['actors'] if pd.notna(row['actors']) else "N/A",
+                "Plot": row['plot'] if pd.notna(row['plot']) else "N/A",
                 "Poster": "N/A",
                 "Type": "movie",
-                "Response": "True"
+                "Response": "True",
+                "imdbRating": row['imdb_rating'] if pd.notna(row['imdb_rating']) else "N/A",
+                "Runtime": row['runtime'] if pd.notna(row['runtime']) else "N/A",
+                "Rated": row['rated'] if pd.notna(row['rated']) else "N/A"
             }
         except Exception as e:
             print(f"Error getting local movie details for {imdb_id}: {str(e)}")
@@ -209,26 +242,33 @@ class KNNMovieRecommender:
     
     async def recommend_movies_with_details(
         self, 
-        genre_features: np.ndarray, 
+        query_embedding: np.ndarray, 
         limit: int = 25
     ) -> List[Dict]:
         """
-        Get movie recommendations with full details from OMDb
-        """
-        # Get similar MovieLens movie IDs
-        imdb_movie_ids = self.get_similar_movies(genre_features)
+        Get movie recommendations with full details from OMDb or local data
         
-        # Convert to IMDb IDs and fetch details
+        Args:
+            query_embedding: The query embedding vector
+            limit: Maximum number of recommendations to return
+            
+        Returns:
+            List of movie dictionaries with details
+        """
+        # Get similar movie IMDb IDs
+        imdb_movie_ids = self.get_similar_movies(query_embedding)
+        
+        # Fetch details
         movies_with_details = []
         
         for imdb_id in imdb_movie_ids:
             if len(movies_with_details) >= limit:
                 break
             
-            # Fetch details from OMDb
+            # Fetch details from OMDb or fall back to local data
             movie_details = await self.get_movie_details_from_omdb(str(imdb_id))
             if movie_details:
-                movie_details['imdbId'] = imdb_id  # Add Imdb ID for reference
+                movie_details['imdbId'] = imdb_id  # Add IMDb ID for reference
                 movies_with_details.append(movie_details)
         
         return movies_with_details
@@ -253,8 +293,6 @@ def get_recommender(
     if _recommender_instance is None:
         if data_path is None:
             raise ValueError("data_path must be provided on first call to get_recommender()")
-        if links_file is None:
-            raise ValueError("links_file must be provided on first call to get_recommender()")
         
         # Get API key from environment if not provided
         if omdb_api_key is None:
@@ -266,51 +304,53 @@ def get_recommender(
         # Create and initialize recommender
         _recommender_instance = KNNMovieRecommender(data_path, omdb_api_key, k)
         _recommender_instance.load_data()
+        _recommender_instance.load_embedding_model()
         _recommender_instance.build_index()
-        _recommender_instance.load_movielens_to_imdb_mapping(links_file, movies_file)
+        # Links file kept for backwards compatibility but not needed with embeddings
+        if links_file:
+            _recommender_instance.load_movielens_to_imdb_mapping(links_file, movies_file)
     
     return _recommender_instance
 
 async def main():
-    from user_preferences import UserPreferences
-    
-    # create a user preferences example
-    user = UserPreferences(
-        genre_columns=[col for col in pd.read_csv(DATA_PATH, nrows=1).columns if col.startswith('genre_')],
-        movies_path='data/movies.csv',
-        links_path='data/links.csv'
-    )
-
-    # Add some preferences (example IMDb IDs and ratings)
-    user.add_preference('0114709', 0.0)  # Toy Story
-    user.add_preference('0133093', 1.0)  # The Matrix
-    user.add_preference('1375666', 1.0)  # Inception
-
+    """
+    Example usage of the recommender with semantic embeddings
+    """
     # Initialize recommender
     recommender = get_recommender(
         data_path=DATA_PATH,
-        links_file=LINKS_FILE,
+        links_file=None,  # Not needed with embeddings CSV
         omdb_api_key=OMDB_API_KEY,
-        k=10
+        k=100,
+        allow_no_api_key=True  # Allow testing without API key
     )
     
-    # get recommendations based on user preferences
-    recommendations = recommender.recommend_movies_with_details(
-        genre_features=user.compute_query_vector(),
-        limit=25
+    # Create a query based on movie preferences
+    # For example, looking for movies similar to "action sci-fi thriller with AI"
+    query_text = "Title: The Matrix. Genre: Action, Sci-Fi. Actors: Keanu Reeves. Plot: A hacker discovers reality is a simulation."
+    
+    # Generate query embedding
+    query_embedding = recommender.create_query_embedding(query_text)
+    
+    # Get recommendations
+    recommendations = await recommender.recommend_movies_with_details(
+        query_embedding=query_embedding,
+        limit=10
     )
 
-    recommended_movies = await recommendations
-    for movie in recommended_movies:
-        print(f"{movie.get('Title')} ({movie.get('Year')}), IMDb ID: {movie.get('imdbID')}")
+    print("\nTop 10 Recommendations:")
+    for i, movie in enumerate(recommendations, 1):
+        print(f"{i}. {movie.get('Title')} ({movie.get('Year')})")
+        print(f"   Genre: {movie.get('Genre')}")
+        print(f"   IMDb ID: {movie.get('imdbID')}")
+        print()
 
 if __name__ == "__main__":
     # Example usage
     import asyncio
     
     # Configure paths (update these to your actual paths)
-    DATA_PATH = "data/ratings_binary_genres_tfidf.csv"
-    LINKS_FILE = "data/links.csv"
+    DATA_PATH = "../model/movies_with_embeddings.csv"
     OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
     
     asyncio.run(main())

@@ -1,9 +1,10 @@
 // API configuration
+// Only allow localhost:8000 for local development or the configured Render backend
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
 // Debug: Log the API base URL being used
 console.log('🔧 API_BASE_URL configured as:', API_BASE_URL);
-console.log('🔧 Environment variables:', import.meta.env);
+console.log('🔧 VITE_API_BASE_URL from env:', import.meta.env.VITE_API_BASE_URL);
 
 export interface OMDbMovieDetail {
   imdbID: string;
@@ -132,4 +133,58 @@ export async function addPreferenceAndGetRecommendations(
   
   // Get new recommendations with all preferences
   return getRecommendationsFromPreferences(updatedPreferences, limit);
+}
+
+/**
+ * Get recommendations similar to a specific movie
+ */
+export async function getSimilarMovies(
+  imdbId: string,
+  limit: number = 10
+): Promise<ApiResponse<OMDbMovieDetail[]>> {
+  try {
+    const params = new URLSearchParams({ limit: limit.toString() });
+    const url = `${API_BASE_URL}/api/recommendations/similar/${imdbId}?${params}`;
+    const response = await fetch(url);
+    
+    if (!response.ok) {
+      const errorData = await response.json();
+      return { error: errorData.detail || 'Failed to fetch similar movies' };
+    }
+    
+    const data = await response.json();
+    return { data };
+  } catch (error) {
+    console.error('Error fetching similar movies:', error);
+    return { error: 'Network error occurred while fetching similar movies' };
+  }
+}
+
+/**
+ * Search for movies by text query using embedding model
+ */
+export async function searchMoviesByQuery(
+  query: string,
+  limit: number = 25
+): Promise<ApiResponse<OMDbMovieDetail[]>> {
+  try {
+    const params = new URLSearchParams({ 
+      query: query,
+      limit: limit.toString() 
+    });
+    const url = `${API_BASE_URL}/api/recommendations/knn?${params}`;
+    console.log('🔍 Searching movies with query:', query);
+    const response = await fetch(url);
+    
+    if (!response.ok) {
+      const errorData = await response.json();
+      return { error: errorData.detail || 'Failed to search movies' };
+    }
+    
+    const data = await response.json();
+    return { data };
+  } catch (error) {
+    console.error('Error searching movies:', error);
+    return { error: 'Network error occurred while searching movies' };
+  }
 }

@@ -4,11 +4,10 @@ from pydantic import BaseModel
 import httpx
 import os
 import numpy as np
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pathlib import Path
 from dotenv import load_dotenv
 from knn_recommender import get_recommender
-from user_preferences import UserPreferences
 
 # Load environment variables from .env file
 load_dotenv()
@@ -33,58 +32,50 @@ app.add_middleware(
 
 # Load API key from environment variable
 OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
-DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 
 # Initialize paths for KNN recommender
-RATINGS_FILE = DATA_DIR / "ratings_binary_genres_tfidf.csv"
-LINKS_FILE = DATA_DIR / "links.csv"
-MOVIES_FILE = DATA_DIR / "movies.csv"
+EMBEDDINGS_FILE = DATA_DIR / "movies_with_embeddings.csv"
 
 # Initialize KNN recommender on startup
 recommender = None
-user_preferences_manager = None
 cached_initial_recommendations = None  # Cache for initial recommendations
+
+# Store user ratings: {imdb_id: rating} where rating is 1.0 (like) or 0.0 (dislike)
+user_ratings: Dict[str, float] = {}
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize the KNN recommender on application startup"""
-    global recommender, user_preferences_manager, cached_initial_recommendations
+    global recommender, cached_initial_recommendations
     try:
-        if RATINGS_FILE.exists() and LINKS_FILE.exists():
-            print("Initializing KNN recommender...")
+        if EMBEDDINGS_FILE.exists():
+            print("Initializing KNN recommender with embeddings...")
             recommender = get_recommender(
-                data_path=str(RATINGS_FILE),
-                links_file=str(LINKS_FILE),
-                movies_file=str(MOVIES_FILE) if MOVIES_FILE.exists() else None,
+                data_path=str(EMBEDDINGS_FILE),
+                links_file=None,  # Not needed with embeddings
+                movies_file=None,
                 omdb_api_key=OMDB_API_KEY,
                 k=100
             )
             print("KNN recommender initialized successfully!")
             
-            # Initialize UserPreferences manager
-            print("Initializing UserPreferences manager...")
-            user_preferences_manager = UserPreferences(
-                genre_columns=recommender.genre_columns,
-                movies_path=str(MOVIES_FILE),
-                links_path=str(LINKS_FILE)
-            )
-            print("UserPreferences manager initialized successfully!")
-            
-            # Precompute initial recommendations
+            # Precompute initial recommendations using mean of all embeddings
             print("Precomputing initial recommendations...")
-            mean_genre_vector = recommender.compute_mean_genre_vector()
+            # Use the mean embedding to get a neutral, representative sample
+            mean_embedding = recommender.compute_mean_embedding()
             cached_initial_recommendations = await recommender.recommend_movies_with_details(
-                genre_features=mean_genre_vector,
+                query_embedding=mean_embedding,
                 limit=25
             )
             print(f"Initial recommendations precomputed: {len(cached_initial_recommendations)} movies cached")
         else:
-            print(f"Warning: Data files not found in {DATA_DIR}")
-            print(f"  - ratings_binary_genres_tfidf.csv exists: {RATINGS_FILE.exists()}")
-            print(f"  - links.csv exists: {LINKS_FILE.exists()}")
+            print(f"Warning: Embeddings file not found: {EMBEDDINGS_FILE}")
             print("KNN recommendations will not be available.")
     except Exception as e:
         print(f"Error initializing KNN recommender: {e}")
+        import traceback
+        traceback.print_exc()
         print("KNN recommendations will not be available.")
 
 
@@ -122,6 +113,10 @@ class UserPreferenceInput(BaseModel):
 class RecommendationRequest(BaseModel):
     preferences: List[UserPreferenceInput]
     limit: int = 20
+
+class RatingSubmission(BaseModel):
+    imdb_id: str
+    rating: float  # 1.0 for like, 0.0 for dislike
 
 @app.get("/")
 async def root():
@@ -258,13 +253,13 @@ async def get_initial_recommendations(limit: int = 20):
         )
 
 @app.get("/api/recommendations/knn")
-async def get_knn_recommendations(genres: str, limit: int = 25):
+async def get_knn_recommendations(query: str, limit: int = 25):
     """
-    Get movie recommendations using KNN based on genre preferences
+    Get movie recommendations using KNN based on a text query
     
     Args:
-        genres: Comma-separated list of genres (e.g., "Action,Sci-Fi,Adventure")
-        limit: Maximum number of movies to return (default: 20)
+        query: Text description of desired movie (e.g., "action sci-fi thriller with AI and robots")
+        limit: Maximum number of movies to return (default: 25)
     
     Returns:
         List of movie details for recommended movies
@@ -282,38 +277,25 @@ async def get_knn_recommendations(genres: str, limit: int = 25):
         )
     
     try:
-        # Parse genres from comma-separated string
-        liked_genres = [g.strip() for g in genres.split(",") if g.strip()]
-        
-        if not liked_genres:
+        if not query or not query.strip():
             raise HTTPException(
                 status_code=400,
-                detail="At least one genre must be provided"
+                detail="Query text must be provided"
             )
         
-        # Create a query vector based on genres
-        query_vector = np.zeros(len(recommender.genre_columns), dtype=np.float32)
-        
-        for i, col in enumerate(recommender.genre_columns):
-            genre_name = col.replace('genre_', '')
-            if genre_name in liked_genres:
-                query_vector[i] = 1.0
-        
-        # Normalize the vector
-        norm = np.linalg.norm(query_vector)
-        if norm > 0:
-            query_vector = query_vector / norm
+        # Generate embedding for the query
+        query_embedding = recommender.create_query_embedding(query)
         
         # Get recommendations
         recommendations = await recommender.recommend_movies_with_details(
-            genre_features=query_vector,
+            query_embedding=query_embedding,
             limit=limit
         )
         
         if not recommendations:
             raise HTTPException(
                 status_code=404,
-                detail="No recommendations found for the given genres"
+                detail="No recommendations found for the given query"
             )
         
         return recommendations
@@ -329,7 +311,7 @@ async def get_knn_recommendations(genres: str, limit: int = 25):
 @app.get("/api/genres")
 async def get_available_genres():
     """
-    Get list of available genres for KNN recommendations
+    Get list of unique genres from the movies database
     
     Returns:
         List of genre names
@@ -341,9 +323,16 @@ async def get_available_genres():
         )
     
     try:
-        # Extract genre names from genre columns
-        genres = [col.replace('genre_', '') for col in recommender.genre_columns]
-        return {"genres": sorted(genres)}
+        # Extract unique genres from the movies dataframe
+        all_genres = set()
+        for genres_str in recommender.movies_df['genre'].dropna():
+            # Split by comma and add individual genres
+            for genre in genres_str.split(','):
+                genre = genre.strip()
+                if genre and genre != 'N/A':
+                    all_genres.add(genre)
+        
+        return {"genres": sorted(list(all_genres))}
     
     except Exception as e:
         raise HTTPException(
@@ -355,6 +344,7 @@ async def get_available_genres():
 async def get_recommendations_from_user_preferences(request: RecommendationRequest):
     """
     Get movie recommendations based on user preferences (liked/disliked movies)
+    Uses weighted embedding: (sum of liked embeddings - sum of disliked embeddings) / total count
     
     Args:
         request: RecommendationRequest containing list of preferences and limit
@@ -362,7 +352,9 @@ async def get_recommendations_from_user_preferences(request: RecommendationReque
     Returns:
         List of movie details for recommended movies
     """
-    if recommender is None or user_preferences_manager is None:
+    global user_ratings
+    
+    if recommender is None:
         raise HTTPException(
             status_code=503,
             detail="KNN recommender not available. Data files may be missing."
@@ -375,35 +367,51 @@ async def get_recommendations_from_user_preferences(request: RecommendationReque
         )
     
     try:
-        # Clear previous preferences
-        user_preferences_manager.preferences = {}
-        user_preferences_manager.genre_vectors = {}
-        
-        # Add user preferences
-        for pref in request.preferences:
-            try:
-                user_preferences_manager.add_preference(
-                    imdb_id=pref.imdb_id,
-                    rating=pref.rating
-                )
-            except ValueError as e:
-                print(f"Warning: Could not add preference for {pref.imdb_id}: {e}")
-                continue
-        
-        if not user_preferences_manager.preferences:
+        if not request.preferences:
             raise HTTPException(
                 status_code=400,
-                detail="No valid preferences were provided"
+                detail="At least one preference must be provided"
             )
         
-        # Compute query vector
-        query_vector = user_preferences_manager.compute_query_vector()
+        # Update stored ratings with all preferences from request
+        for pref in request.preferences:
+            # Format IMDb ID to include 'tt' prefix if not present
+            imdb_id = pref.imdb_id if pref.imdb_id.startswith('tt') else f"tt{pref.imdb_id.zfill(7)}"
+            user_ratings[imdb_id] = pref.rating
+            print(f"Stored rating: {imdb_id} = {pref.rating}")
         
-        # Get recommendations using the query vector
-        recommendations = await recommender.recommend_movies_with_details(
-            genre_features=query_vector,
-            limit=request.limit
+        # Separate likes and dislikes
+        liked_imdb_ids = [imdb_id for imdb_id, rating in user_ratings.items() if rating >= 0.5]
+        disliked_imdb_ids = [imdb_id for imdb_id, rating in user_ratings.items() if rating < 0.5]
+        
+        print(f"Current ratings - Likes: {len(liked_imdb_ids)}, Dislikes: {len(disliked_imdb_ids)}")
+        print(f"Liked movies: {liked_imdb_ids}")
+        print(f"Disliked movies: {disliked_imdb_ids}")
+        
+        # Compute weighted embedding from preferences
+        query_embedding = recommender.compute_weighted_embedding_from_preferences(
+            liked_imdb_ids=liked_imdb_ids,
+            disliked_imdb_ids=disliked_imdb_ids
         )
+        
+        if query_embedding is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not compute embedding from preferences. Please check IMDb IDs."
+            )
+        
+        # Get recommendations
+        recommendations = await recommender.recommend_movies_with_details(
+            query_embedding=query_embedding,
+            limit=request.limit + len(user_ratings)  # Get extra to account for filtering
+        )
+        
+        # Filter out movies that were already rated
+        rated_imdb_ids = set(user_ratings.keys())
+        recommendations = [r for r in recommendations if r.get('imdbID') not in rated_imdb_ids]
+        
+        # Limit to requested amount
+        recommendations = recommendations[:request.limit]
         
         if not recommendations:
             raise HTTPException(
@@ -411,19 +419,161 @@ async def get_recommendations_from_user_preferences(request: RecommendationReque
                 detail="No recommendations found for the given preferences"
             )
         
+        print(f"Returning {len(recommendations)} recommendations")
         return recommendations
     
     except HTTPException:
         raise
-    except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Error generating recommendations: {str(e)}"
+        )
+
+@app.post("/api/ratings/submit")
+async def submit_rating(rating: RatingSubmission):
+    """
+    Submit a single movie rating (like or dislike)
+    
+    Args:
+        rating: RatingSubmission containing imdb_id and rating value
+    
+    Returns:
+        Confirmation of stored rating
+    """
+    global user_ratings
+    
+    try:
+        # Format IMDb ID to include 'tt' prefix if not present
+        imdb_id = rating.imdb_id if rating.imdb_id.startswith('tt') else f"tt{rating.imdb_id.zfill(7)}"
+        
+        # Store the rating
+        user_ratings[imdb_id] = rating.rating
+        
+        # Count current likes and dislikes
+        likes = sum(1 for r in user_ratings.values() if r >= 0.5)
+        dislikes = sum(1 for r in user_ratings.values() if r < 0.5)
+        
+        print(f"Rating stored: {imdb_id} = {rating.rating}")
+        print(f"Total ratings: {len(user_ratings)} (Likes: {likes}, Dislikes: {dislikes})")
+        
+        return {
+            "success": True,
+            "imdb_id": imdb_id,
+            "rating": rating.rating,
+            "total_ratings": len(user_ratings),
+            "likes": likes,
+            "dislikes": dislikes
+        }
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error storing rating: {str(e)}"
+        )
+
+@app.get("/api/ratings/all")
+async def get_all_ratings():
+    """
+    Get all stored user ratings
+    
+    Returns:
+        Dictionary of all ratings with summary statistics
+    """
+    likes = {imdb_id: rating for imdb_id, rating in user_ratings.items() if rating >= 0.5}
+    dislikes = {imdb_id: rating for imdb_id, rating in user_ratings.items() if rating < 0.5}
+    
+    return {
+        "total_ratings": len(user_ratings),
+        "likes": likes,
+        "dislikes": dislikes,
+        "like_count": len(likes),
+        "dislike_count": len(dislikes)
+    }
+
+@app.delete("/api/ratings/clear")
+async def clear_ratings():
+    """
+    Clear all stored user ratings (useful for testing)
+    
+    Returns:
+        Confirmation of cleared ratings
+    """
+    global user_ratings
+    count = len(user_ratings)
+    user_ratings.clear()
+    print(f"Cleared {count} ratings")
+    return {"success": True, "cleared_count": count}
+
+@app.get("/api/recommendations/similar/{imdb_id}")
+async def get_similar_to_movie(imdb_id: str, limit: int = 10):
+    """
+    Get movie recommendations similar to a specific movie
+    
+    Args:
+        imdb_id: IMDb ID of the movie (without 'tt' prefix)
+        limit: Maximum number of movies to return (default: 10)
+    
+    Returns:
+        List of movie details for similar movies
+    """
+    if recommender is None:
+        raise HTTPException(
+            status_code=503,
+            detail="KNN recommender not available. Data files may be missing."
+        )
+    
+    if not OMDB_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="OMDb API key not configured. Please set OMDB_API_KEY environment variable."
+        )
+    
+    try:
+        # Format IMDb ID to include 'tt' prefix if not present
+        formatted_imdb_id = imdb_id if imdb_id.startswith('tt') else f"tt{imdb_id.zfill(7)}"
+        
+        # Check if movie exists in our database
+        if formatted_imdb_id not in recommender.imdb_id_to_idx:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Movie with IMDb ID {formatted_imdb_id} not found in database"
+            )
+        
+        # Get the embedding for this movie
+        movie_idx = recommender.imdb_id_to_idx[formatted_imdb_id]
+        movie_embedding = recommender.embeddings[movie_idx]
+        
+        # Get recommendations based on this movie's embedding
+        recommendations = await recommender.recommend_movies_with_details(
+            query_embedding=movie_embedding,
+            limit=limit + 1  # Get extra to exclude the source movie
+        )
+        
+        # Filter out the source movie itself
+        recommendations = [r for r in recommendations if r.get('imdbID') != formatted_imdb_id]
+        
+        # Limit to requested amount
+        recommendations = recommendations[:limit]
+        
+        if not recommendations:
+            raise HTTPException(
+                status_code=404,
+                detail="No similar movies found"
+            )
+        
+        return recommendations
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error finding similar movies: {str(e)}"
         )
 
 if __name__ == "__main__":

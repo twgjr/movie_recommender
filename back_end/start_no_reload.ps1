@@ -1,7 +1,7 @@
-# Movie Recommender Backend Start Script
-# This script activates the virtual environment and starts the FastAPI server
+# Movie Recommender Backend Start Script (No Auto-Reload)
+# This script activates the virtual environment and starts the FastAPI server without auto-reload
 
-Write-Host "Starting Movie Recommender Backend..." -ForegroundColor Cyan
+Write-Host "Starting Movie Recommender Backend (No Auto-Reload)..." -ForegroundColor Cyan
 
 # Check if virtual environment exists
 if (Test-Path ".\venv\Scripts\Activate.ps1") {
@@ -40,8 +40,9 @@ if (-not $env:OMDB_API_KEY -or $env:OMDB_API_KEY -eq "your_api_key_here") {
 
 Write-Host "Starting FastAPI server on http://localhost:8000" -ForegroundColor Green
 Write-Host "API documentation available at http://localhost:8000/docs" -ForegroundColor Green
+Write-Host "Note: Auto-reload is DISABLED - restart manually after code changes" -ForegroundColor Yellow
 Write-Host "Press Ctrl+C to stop the server" -ForegroundColor Yellow
 Write-Host ""
 
-# Start the server (only watch current directory for Python files, not venv or model)
-python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000 --reload-dir "." --reload-include "*.py"
+# Start the server without reload
+python -m uvicorn main:app --host 0.0.0.0 --port 8000

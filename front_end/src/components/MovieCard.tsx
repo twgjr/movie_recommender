@@ -25,7 +25,7 @@ interface MovieCardProps {
 export function MovieCard({ movie, onRate, onDetails, rating }: MovieCardProps) {
   return (
     <Card 
-      className="relative overflow-hidden shadow-lg rounded-md bg-[#1a1a1a] border border-white/10 group cursor-pointer transition-transform duration-200 hover:scale-105" 
+      className="relative w-full overflow-hidden shadow-lg rounded-md bg-[#1a1a1a] border border-white/10 group cursor-pointer transition-transform duration-200 hover:scale-105" 
       style={{ aspectRatio: '2/3' }}
       onClick={() => onDetails(movie)}
     >
@@ -33,7 +33,7 @@ export function MovieCard({ movie, onRate, onDetails, rating }: MovieCardProps) 
       <img
         src={movie.imageUrl}
         alt={movie.title}
-        className="w-full h-full object-cover"
+        className="w-full h-full object-cover absolute inset-0"
         onError={(e) => {
           e.currentTarget.src = 'https://via.placeholder.com/300x450?text=No+Poster';
         }}
